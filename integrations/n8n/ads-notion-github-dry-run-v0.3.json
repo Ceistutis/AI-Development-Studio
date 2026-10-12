@@ -1,0 +1,256 @@
+{
+  "name": "ADS — Notion → GitHub Dry Run v0.3",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-start",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/data_sources/b0b01fc0-30d3-49cf-9b4e-1d60a9d8476d/query",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"page_size\":100}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "notion-read",
+      "name": "Notion — Read Source",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        320
+      ],
+      "notes": "Selecionar a credencial OAuth2 Notion account no n8n. URL da data source do Studio."
+    },
+    {
+      "parameters": {
+        "jsCode": "const pages = $input.first().json.results;\nif (!Array.isArray(pages)) throw new Error('Notion não devolveu results[]. Falhar fechado.');\nconst plain = p => {\n  if (!p) return '';\n  if (p.type === 'status') return p.status?.name ?? '';\n  if (p.type === 'select') return p.select?.name ?? '';\n  if (p.type === 'url') return p.url ?? '';\n  if (p.type === 'title') return (p.title ?? []).map(x => x.plain_text ?? x.text?.content ?? '').join('');\n  if (p.type === 'rich_text') return (p.rich_text ?? []).map(x => x.plain_text ?? x.text?.content ?? '').join('');\n  return '';\n};\nconst eligible = [], blocked = [], pending = [], rejected = [];\nfor (const page of pages) {\n  const p = page.properties ?? {};\n  const row = {\n    notion_id: page.id, briefing: plain(p['Briefing']), status: plain(p['Status']),\n    projeto: plain(p['Projeto']), objetivo: plain(p['Objetivo']),\n    prioridade: plain(p['Prioridade']), criterios: plain(p['Critérios de aceite']),\n    repositorio: plain(p['Repositório']), issue_github: plain(p['Issue GitHub']),\n    edited_at: page.last_edited_time\n  };\n  if (row.status === 'Rejeitado') { rejected.push(row); continue; }\n  if (row.status !== 'Aprovado') { pending.push(row); continue; }\n  const required = ['briefing','projeto','objetivo','criterios','repositorio'];\n  const missing = required.filter(k => !row[k]);\n  if (missing.length) { blocked.push({...row,motivo:'Campos obrigatórios ausentes: '+missing.join(', ')}); continue; }\n  if (row.repositorio !== 'https://github.com/Ceistutis/AI-Development-Studio') {\n    blocked.push({...row,motivo:'Repositório diferente do autorizado para este MVP'}); continue;\n  }\n  if (row.issue_github) { blocked.push({...row,motivo:'Issue GitHub já preenchida'}); continue; }\n  eligible.push(row);\n}\nreturn [{json:{eligible,blocked,pending,rejected,counts:{eligible:eligible.length,blocked:blocked.length,pending:pending.length,rejected:rejected.length},mode:'DRY_RUN_NO_WRITES'}}];"
+      },
+      "id": "classify",
+      "name": "Classificar briefings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-eligible",
+              "leftValue": "={{ $json.counts.eligible }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-eligible",
+      "name": "Há elegíveis?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        900,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "eligible",
+        "options": {
+          "include": "noOtherFields"
+        }
+      },
+      "id": "split",
+      "name": "Separar elegíveis",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1130,
+        210
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/search/issues",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ 'repo:Ceistutis/AI-Development-Studio is:issue in:body \"NOTION_BRIEFING_ID:' + $json.notion_id + '\"' }}"
+            },
+            {
+              "name": "per_page",
+              "value": "100"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "github-search",
+      "name": "GitHub — Search marker (read only)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        210
+      ],
+      "notes": "Selecionar credencial GitHub já configurada; search API não prova idempotência sob concorrência."
+    },
+    {
+      "parameters": {
+        "jsCode": "const searched = $input.all();\nconst original = $('Separar elegíveis').all();\nreturn searched.map((item,i)=>{\n  const b = original[i]?.json;\n  if (!b) throw new Error('Falha em correlacionar resultados GitHub com briefings; não avançar.');\n  const payload=item.json;\n  if (!Array.isArray(payload.items) || typeof payload.total_count !== 'number') throw new Error('Resposta inesperada do GitHub.');\n  const matches=payload.items.filter(x => !x.pull_request && (x.body??'').includes('NOTION_BRIEFING_ID:'+b.notion_id));\n  return {json:{\n    mode:'DRY_RUN_NO_WRITES',notion_id:b.notion_id,briefing:b.briefing,\n    github_matches:matches.map(x=>({number:x.number,url:x.html_url})),\n    decision:matches.length?'BLOQUEADO_ISSUE_EXISTENTE':'SIMULACAO_PRONTA',\n    warning:'Busca por marcador não garante idempotência concorrente; não ativar escrita sem lock/deduplicação.',\n    proposed_issue:{\n      title:'[ADS] '+b.briefing,\n      body:'Projeto: '+b.projeto+'\\\\nObjetivo: '+b.objetivo+'\\\\nCritérios de aceite: '+b.criterios+'\\\\n\\\\nNOTION_BRIEFING_ID:'+b.notion_id\n    }\n  }};\n});"
+      },
+      "id": "dry-run",
+      "name": "Preparar proposta (sem escrita)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1590,
+        210
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{mode:'DRY_RUN_NO_WRITES',message:'Nenhum briefing elegível. Nenhuma chamada GitHub necessária.',summary:$input.first().json}}];"
+      },
+      "id": "none",
+      "name": "Resumo sem elegíveis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1130,
+        450
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Notion — Read Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Read Source": {
+      "main": [
+        [
+          {
+            "node": "Classificar briefings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classificar briefings": {
+      "main": [
+        [
+          {
+            "node": "Há elegíveis?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Há elegíveis?": {
+      "main": [
+        [
+          {
+            "node": "Separar elegíveis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resumo sem elegíveis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Separar elegíveis": {
+      "main": [
+        [
+          {
+            "node": "GitHub — Search marker (read only)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — Search marker (read only)": {
+      "main": [
+        [
+          {
+            "node": "Preparar proposta (sem escrita)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
