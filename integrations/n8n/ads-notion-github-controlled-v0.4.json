@@ -1,0 +1,946 @@
+{
+  "name": "ADS — Controlled GitHub Issue Creation v0.4 (disabled)",
+  "nodes": [
+    {
+      "id": "start",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "parameters": {},
+      "position": [
+        200,
+        260
+      ]
+    },
+    {
+      "id": "source",
+      "name": "Notion — Consultar briefings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/data_sources/b0b01fc0-30d3-49cf-9b4e-1d60a9d8476d/query",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"page_size\":100}"
+      },
+      "position": [
+        440,
+        260
+      ]
+    },
+    {
+      "id": "candidate",
+      "name": "Selecionar briefing aprovado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Ativação de escrita requer alteração explícita em cópia importada, após QA.\nconst ENABLE_REAL_WRITES = false;\nconst REPOSITORY = 'Ceistutis/AI-Development-Studio';\nconst source = $input.first().json;\nif (!Array.isArray(source.results) || typeof source.has_more !== 'boolean') throw new Error('Resposta Notion inesperada; nenhuma escrita autorizada.');\nif (source.has_more) throw new Error('Notion devolveu has_more=true. Implementar paginação antes de escritas.');\nconst plain = p => {\n  if (!p) return '';\n  if (p.type === 'status') return p.status?.name ?? '';\n  if (p.type === 'select') return p.select?.name ?? '';\n  if (p.type === 'url') return p.url ?? '';\n  if (p.type === 'title') return (p.title ?? []).map(x => x.plain_text ?? x.text?.content ?? '').join('');\n  if (p.type === 'rich_text') return (p.rich_text ?? []).map(x => x.plain_text ?? x.text?.content ?? '').join('');\n  return '';\n};\nconst eligible = [];\nfor (const page of source.results) {\n  const p = page.properties ?? {};\n  const row = {\n    notion_id: page.id,\n    briefing: plain(p['Briefing']),\n    status: plain(p['Status']),\n    projeto: plain(p['Projeto']),\n    objetivo: plain(p['Objetivo']),\n    criterios: plain(p['Critérios de aceite']),\n    repositorio: plain(p['Repositório']),\n    issue_github: plain(p['Issue GitHub']),\n    edited_at: page.last_edited_time\n  };\n  if (row.status !== 'Aprovado' || row.issue_github) continue;\n  const required = ['notion_id','briefing','projeto','objetivo','criterios','repositorio','edited_at'];\n  if (required.some(k => !row[k])) continue;\n  if (row.repositorio !== 'https://github.com/' + REPOSITORY) continue;\n  eligible.push(row);\n}\nif (eligible.length > 1) throw new Error('Mais de um briefing aprovado elegível: v0.4 processa exatamente um por execução.');\nif (!eligible.length) return [{json:{run_enabled:false,reason:'Nenhum briefing elegível.'}}];\nconst b=eligible[0];\nconst title='[ADS] '+b.briefing;\nconst body=[\n  'Projeto: '+b.projeto,\n  '',\n  'Objetivo: '+b.objetivo,\n  '',\n  'Critérios de aceite:',\n  b.criterios,\n  '',\n  'NOTION_BRIEFING_ID:'+b.notion_id\n].join('\\n');\nreturn [{json:{...b,repository:REPOSITORY,issue_title:title,issue_body:body,\n  run_enabled:ENABLE_REAL_WRITES,reason:ENABLE_REAL_WRITES?'APROVACAO_MANUAL':'Escritas desativadas no arquivo importado.'}}];"
+      },
+      "position": [
+        700,
+        260
+      ]
+    },
+    {
+      "id": "enabled",
+      "name": "Escritas autorizadas?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "enabled-condition",
+              "leftValue": "={{ $json.run_enabled }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        940,
+        260
+      ]
+    },
+    {
+      "id": "off",
+      "name": "Sem escrita — resumo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{json:{mode:'V0_4_DISABLED',...$input.first().json}}];"
+      },
+      "position": [
+        1160,
+        440
+      ]
+    },
+    {
+      "id": "reserve",
+      "name": "Postgres — Reservar chave",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inserted AS (\n  INSERT INTO ads_issue_ledger(repository, notion_id, notion_edited_at, status)\n  VALUES ($1, $2::uuid, $3::timestamptz, 'RESERVED')\n  ON CONFLICT (repository, notion_id) DO NOTHING\n  RETURNING notion_id\n)\nSELECT l.repository, l.notion_id, l.status, l.issue_url,\n  EXISTS(SELECT 1 FROM inserted) AS acquired\nFROM ads_issue_ledger l\nWHERE l.repository = $1 AND l.notion_id = $2::uuid;",
+        "options": {
+          "queryReplacement": "={{ [$('Selecionar briefing aprovado').first().json.repository, $('Selecionar briefing aprovado').first().json.notion_id, $('Selecionar briefing aprovado').first().json.edited_at] }}"
+        }
+      },
+      "position": [
+        1160,
+        180
+      ]
+    },
+    {
+      "id": "decision",
+      "name": "Decidir após reserva",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const l=$input.first().json;\nconst b=$('Selecionar briefing aprovado').first().json;\nif (String(l.notion_id).toLowerCase()!==b.notion_id.toLowerCase() || l.repository!==b.repository) throw new Error('Ledger não corresponde ao briefing.');\nconst action=(l.acquired===true && l.status==='RESERVED')?'CREATE':\n  (l.status==='CREATED' && typeof l.issue_url==='string' && /^https:\\/\\/github\\.com\\/Ceistutis\\/AI-Development-Studio\\/issues\\/\\d+$/.test(l.issue_url))?'RECOVER_LINK':'HALT';\nreturn [{json:{...l,action,create:action==='CREATE',recover:action==='RECOVER_LINK',\n  reason:action==='HALT'?'Registro existente em '+l.status+'; nunca recriar automaticamente.':''}}];"
+      },
+      "position": [
+        1380,
+        180
+      ]
+    },
+    {
+      "id": "create-gate",
+      "name": "Reserva nova?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "create-gate-condition",
+              "leftValue": "={{ $json.create }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        1590,
+        180
+      ]
+    },
+    {
+      "id": "recover-gate",
+      "name": "Recuperar vínculo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "recover-gate-condition",
+              "leftValue": "={{ $json.recover }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "position": [
+        1800,
+        490
+      ]
+    },
+    {
+      "id": "halt",
+      "name": "Parada segura — resumo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{json:{mode:'V0_4_HALT',...$input.first().json}}];"
+      },
+      "position": [
+        2030,
+        650
+      ]
+    },
+    {
+      "id": "search",
+      "name": "GitHub — Buscar marcador",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/search/issues",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ 'repo:Ceistutis/AI-Development-Studio is:issue in:body \"NOTION_BRIEFING_ID:' + $('Selecionar briefing aprovado').first().json.notion_id + '\"' }}"
+            },
+            {
+              "name": "per_page",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "position": [
+        1800,
+        80
+      ]
+    },
+    {
+      "id": "search-check",
+      "name": "Verificar ausência GitHub",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const r=$input.first().json;\nconst marker='NOTION_BRIEFING_ID:'+$('Selecionar briefing aprovado').first().json.notion_id;\nif (!Array.isArray(r.items) || typeof r.total_count!=='number' || r.incomplete_results!==false) throw new Error('Pesquisa GitHub incompleta/inválida. Parar sem criar.');\nif (r.items.some(x => !x.pull_request && (x.body??'').includes(marker))) throw new Error('Issue já existe no GitHub. Conferir e conciliar ledger; não criar novamente.');\nif (r.total_count>100) throw new Error('Muitos resultados GitHub, pesquisa não exaustiva.');\nreturn [{json:{search_checked:true}}];"
+      },
+      "position": [
+        2030,
+        80
+      ]
+    },
+    {
+      "id": "refresh",
+      "name": "Notion — Revalidar página",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.notion.com/v1/pages/' + $('Selecionar briefing aprovado').first().json.notion_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "position": [
+        2240,
+        80
+      ]
+    },
+    {
+      "id": "revalidate",
+      "name": "Conferir aprovação atual",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const p=$input.first().json,b=$('Selecionar briefing aprovado').first().json;\nconst status=p.properties?.['Status']?.select?.name ?? p.properties?.['Status']?.status?.name;\nconst url=p.properties?.['Issue GitHub']?.url ?? '';\nif(p.id!==b.notion_id || status!=='Aprovado' || url || p.last_edited_time!==b.edited_at)\n  throw new Error('Aprovação/briefing alterado desde a leitura; bloquear criação.');\nreturn [{json:{approved_now:true}}];"
+      },
+      "position": [
+        2460,
+        80
+      ]
+    },
+    {
+      "id": "started",
+      "name": "Postgres — Marcar início da criação",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH changed AS (\n  UPDATE ads_issue_ledger SET status='CREATE_STARTED', updated_at=now()\n  WHERE repository=$1 AND notion_id=$2::uuid AND status='RESERVED' AND issue_url IS NULL\n  RETURNING notion_id\n)\nSELECT EXISTS(SELECT 1 FROM changed) AS permitted;",
+        "options": {
+          "queryReplacement": "={{ [$('Selecionar briefing aprovado').first().json.repository, $('Selecionar briefing aprovado').first().json.notion_id] }}"
+        }
+      },
+      "position": [
+        2680,
+        80
+      ]
+    },
+    {
+      "id": "permit",
+      "name": "Exigir transição persistida",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "if($input.first().json.permitted!==true) throw new Error('Não foi possível gravar CREATE_STARTED; proibido chamar GitHub.');return [{json:{permitted:true}}];"
+      },
+      "position": [
+        2900,
+        80
+      ]
+    },
+    {
+      "id": "create",
+      "name": "GitHub — Criar issue UMA vez",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.github.com/repos/Ceistutis/AI-Development-Studio/issues",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({title:$('Selecionar briefing aprovado').first().json.issue_title,body:$('Selecionar briefing aprovado').first().json.issue_body}) }}"
+      },
+      "position": [
+        3120,
+        80
+      ],
+      "retryOnFail": false,
+      "notes": "Sem retry automático. Se a API criar a issue e a execução falhar, ledger CREATE_STARTED exige reconciliação manual."
+    },
+    {
+      "id": "created-check",
+      "name": "Validar retorno da issue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const r=$input.first().json, b=$('Selecionar briefing aprovado').first().json;\nif(!Number.isInteger(r.number) || !new RegExp('^https://github\\\\.com/Ceistutis/AI-Development-Studio/issues/[0-9]+$').test(r.html_url??''))\n  throw new Error('Resposta GitHub ambígua: criar bloqueio manual, não repetir POST.');\nif(!(r.body??'').includes('NOTION_BRIEFING_ID:'+b.notion_id))\n  throw new Error('Issue sem marcador persistido. Revisar manualmente.');\nreturn [{json:{notion_id:b.notion_id,repository:b.repository,issue_url:r.html_url,issue_number:r.number}}];"
+      },
+      "position": [
+        3340,
+        80
+      ]
+    },
+    {
+      "id": "save-created",
+      "name": "Postgres — Registrar issue criada",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH changed AS (\n UPDATE ads_issue_ledger SET status='CREATED', issue_url=$3, issue_number=$4::int, updated_at=now()\n WHERE repository=$1 AND notion_id=$2::uuid AND status='CREATE_STARTED'\n RETURNING issue_url\n)\nSELECT issue_url FROM changed;",
+        "options": {
+          "queryReplacement": "={{ [$('Validar retorno da issue').first().json.repository, $('Validar retorno da issue').first().json.notion_id, $('Validar retorno da issue').first().json.issue_url, $('Validar retorno da issue').first().json.issue_number] }}"
+        }
+      },
+      "position": [
+        3560,
+        80
+      ]
+    },
+    {
+      "id": "saved-check",
+      "name": "Exigir registro CREATED",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const p=$input.first()?.json;\nconst created=$('Validar retorno da issue').first().json;\nif(!p?.issue_url || p.issue_url!==created.issue_url) throw new Error('Issue criada mas não persistida no ledger. NÃO RETENTAR o POST; recuperar manualmente.');\nreturn [{json:{issue_url:p.issue_url}}];"
+      },
+      "position": [
+        3780,
+        80
+      ]
+    },
+    {
+      "id": "page-new",
+      "name": "Notion — Ler antes de vincular",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.notion.com/v1/pages/' + $('Selecionar briefing aprovado').first().json.notion_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "position": [
+        4000,
+        80
+      ]
+    },
+    {
+      "id": "check-link-new",
+      "name": "Conferir vínculo sem conflito",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const p=$input.first().json, b=$('Selecionar briefing aprovado').first().json;\nconst url=$('Exigir registro CREATED').first().json.issue_url;\nconst existing=p.properties?.['Issue GitHub']?.url??'';\nif(p.id!==b.notion_id || (existing && existing!==url)) throw new Error('Notion com vínculo diferente. Não sobrescrever.');\nreturn [{json:{notion_id:b.notion_id,repository:b.repository,issue_url:url}}];"
+      },
+      "position": [
+        4220,
+        80
+      ]
+    },
+    {
+      "id": "patch-new",
+      "name": "Notion — Gravar link",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://api.notion.com/v1/pages/' + $('Conferir vínculo sem conflito').first().json.notion_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({properties:{'Issue GitHub':{url:$('Conferir vínculo sem conflito').first().json.issue_url}}}) }}"
+      },
+      "position": [
+        4440,
+        80
+      ]
+    },
+    {
+      "id": "mark-linked",
+      "name": "Postgres — Finalizar vínculo",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH changed AS (\n UPDATE ads_issue_ledger SET status='LINKED', updated_at=now()\n WHERE repository=$1 AND notion_id=$2::uuid AND status='CREATED' AND issue_url=$3\n RETURNING status,issue_url\n)\nSELECT status,issue_url FROM changed;",
+        "options": {
+          "queryReplacement": "={{ [$('Conferir vínculo sem conflito').first().json.repository, $('Conferir vínculo sem conflito').first().json.notion_id, $('Conferir vínculo sem conflito').first().json.issue_url] }}"
+        }
+      },
+      "position": [
+        4660,
+        80
+      ]
+    },
+    {
+      "id": "complete",
+      "name": "Resultado — Issue vinculada",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const r=$input.first()?.json;if(r?.status!=='LINKED'||!r.issue_url)throw new Error('Falha em persistir LINKED. Não recriar issue.');return [{json:{decision:'LINKED',issue_url:r.issue_url,mode:'V0_4_MANUAL_CONTROLLED'}}];"
+      },
+      "position": [
+        4880,
+        80
+      ]
+    },
+    {
+      "id": "page-recover",
+      "name": "Notion — Ler para recuperação",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.notion.com/v1/pages/' + $('Selecionar briefing aprovado').first().json.notion_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "position": [
+        2030,
+        360
+      ]
+    },
+    {
+      "id": "check-recover",
+      "name": "Validar vínculo recuperável",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const p=$input.first().json,l=$('Decidir após reserva').first().json,b=$('Selecionar briefing aprovado').first().json;\nconst old=p.properties?.['Issue GitHub']?.url??'';\nif(p.id!==b.notion_id || !l.issue_url || (old && old!==l.issue_url))\n  throw new Error('Inconsistência ao recuperar vínculo; não sobrescrever.');\nreturn [{json:{repository:b.repository,notion_id:b.notion_id,issue_url:l.issue_url}}];"
+      },
+      "position": [
+        2250,
+        360
+      ]
+    },
+    {
+      "id": "patch-recover",
+      "name": "Notion — Recuperar link",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://api.notion.com/v1/pages/' + $('Validar vínculo recuperável').first().json.notion_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionOAuth2Api",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2025-09-03"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({properties:{'Issue GitHub':{url:$('Validar vínculo recuperável').first().json.issue_url}}}) }}"
+      },
+      "position": [
+        2470,
+        360
+      ]
+    },
+    {
+      "id": "mark-recovered",
+      "name": "Postgres — Finalizar recuperação",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH changed AS (\n UPDATE ads_issue_ledger SET status='LINKED', updated_at=now()\n WHERE repository=$1 AND notion_id=$2::uuid AND status='CREATED' AND issue_url=$3\n RETURNING status,issue_url\n)\nSELECT status,issue_url FROM changed;",
+        "options": {
+          "queryReplacement": "={{ [$('Validar vínculo recuperável').first().json.repository, $('Validar vínculo recuperável').first().json.notion_id, $('Validar vínculo recuperável').first().json.issue_url] }}"
+        }
+      },
+      "position": [
+        2690,
+        360
+      ]
+    },
+    {
+      "id": "recovered",
+      "name": "Resultado — Link recuperado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const r=$input.first()?.json;if(r?.status!=='LINKED'||!r.issue_url)throw new Error('Falha na transição LINKED');return [{json:{decision:'LINK_RECOVERED',issue_url:r.issue_url,mode:'V0_4_MANUAL_CONTROLLED'}}];"
+      },
+      "position": [
+        2910,
+        360
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Notion — Consultar briefings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Consultar briefings": {
+      "main": [
+        [
+          {
+            "node": "Selecionar briefing aprovado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Selecionar briefing aprovado": {
+      "main": [
+        [
+          {
+            "node": "Escritas autorizadas?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escritas autorizadas?": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Reservar chave",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sem escrita — resumo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Reservar chave": {
+      "main": [
+        [
+          {
+            "node": "Decidir após reserva",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decidir após reserva": {
+      "main": [
+        [
+          {
+            "node": "Reserva nova?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reserva nova?": {
+      "main": [
+        [
+          {
+            "node": "GitHub — Buscar marcador",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Recuperar vínculo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recuperar vínculo?": {
+      "main": [
+        [
+          {
+            "node": "Notion — Ler para recuperação",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parada segura — resumo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — Buscar marcador": {
+      "main": [
+        [
+          {
+            "node": "Verificar ausência GitHub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar ausência GitHub": {
+      "main": [
+        [
+          {
+            "node": "Notion — Revalidar página",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Revalidar página": {
+      "main": [
+        [
+          {
+            "node": "Conferir aprovação atual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conferir aprovação atual": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Marcar início da criação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Marcar início da criação": {
+      "main": [
+        [
+          {
+            "node": "Exigir transição persistida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Exigir transição persistida": {
+      "main": [
+        [
+          {
+            "node": "GitHub — Criar issue UMA vez",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — Criar issue UMA vez": {
+      "main": [
+        [
+          {
+            "node": "Validar retorno da issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar retorno da issue": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Registrar issue criada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Registrar issue criada": {
+      "main": [
+        [
+          {
+            "node": "Exigir registro CREATED",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Exigir registro CREATED": {
+      "main": [
+        [
+          {
+            "node": "Notion — Ler antes de vincular",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Ler antes de vincular": {
+      "main": [
+        [
+          {
+            "node": "Conferir vínculo sem conflito",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conferir vínculo sem conflito": {
+      "main": [
+        [
+          {
+            "node": "Notion — Gravar link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Gravar link": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Finalizar vínculo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Finalizar vínculo": {
+      "main": [
+        [
+          {
+            "node": "Resultado — Issue vinculada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Ler para recuperação": {
+      "main": [
+        [
+          {
+            "node": "Validar vínculo recuperável",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar vínculo recuperável": {
+      "main": [
+        [
+          {
+            "node": "Notion — Recuperar link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion — Recuperar link": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Finalizar recuperação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Finalizar recuperação": {
+      "main": [
+        [
+          {
+            "node": "Resultado — Link recuperado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
